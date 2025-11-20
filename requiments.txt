@@ -2,3 +2,4 @@ librosa
 soundfile
 jiwer
 wandb
+deepspeed

@@ -3,21 +3,25 @@ import sys
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import torch
-import torchaudio
-import pandas as pd
+import librosa           # ← torchaudio 대신 librosa
+import numpy as np
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 def transcribe_audio(wav_path, model, processor, sampling_rate=16000):
-    # Load audio
-    waveform, sr = torchaudio.load(wav_path)
+    # Load audio with librosa (auto-resample)
+    try:
+        audio, sr = librosa.load(wav_path, sr=sampling_rate)
+    except Exception as e:
+        print(f"[ERROR] Failed to load {wav_path}: {e}")
+        return ""
 
-    # Resample if needed
-    if sr != sampling_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, sampling_rate)
+    # Ensure float32 array
+    if not isinstance(audio, np.ndarray):
+        audio = np.array(audio, dtype=np.float32)
 
-    # Convert to log-mel
+    # Convert waveform to log-mel
     input_features = processor.feature_extractor(
-        waveform.squeeze().numpy(),
+        audio,
         sampling_rate=sampling_rate,
         return_tensors="pt"
     ).input_features.to("cuda")
@@ -25,13 +29,19 @@ def transcribe_audio(wav_path, model, processor, sampling_rate=16000):
     # Generate predicted ids
     predicted_ids = model.generate(input_features)
 
-    # Decode to text
-    transcription = processor.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+    # Decode text
+    transcription = processor.tokenizer.batch_decode(
+        predicted_ids,
+        skip_special_tokens=True
+    )[0]
 
     return transcription
 
 
+
 import os
+import pandas as pd
+from tqdm import tqdm 
 def run_inference(model_name, csv_path, save_path=None):
     # Load Whisper Small
     processor = WhisperProcessor.from_pretrained(
@@ -63,7 +73,7 @@ def run_inference(model_name, csv_path, save_path=None):
     else:
         done = set()
 
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df)):
         audio_path = row["abs_path"]
         gt_text = row["transcription"]
 
@@ -95,13 +105,13 @@ if __name__ == "__main__":
     model_series = ['tiny', 'base', 'small', 'medium', 'large', 'turbo']
     
     for model_name in model_series:
-        run_inference(
-            model_name=f"openai/whisper-{model_name}",
-            csv_path="/workspace/kru_data/train.csv",
-            save_path=f"/workspace/results/whisper_{model_name}_inference/train_pred.csv"
-        )
+        # run_inference(
+        #     model_name=f"openai/whisper-{model_name}",
+        #     csv_path="/workspace/kru_data/train.csv",
+        #     save_path=f"/workspace/results/whisper_inference/whisper_{model_name}_inference/train_pred.csv"
+        # )
         run_inference(
             model_name=f"openai/whisper-{model_name}",
             csv_path="/workspace/kru_data/test.csv",
-            save_path=f"/workspace/results/whisper_{model_name}_inference/test_pred.csv"
+            save_path=f"/workspace/results/whisper_inference/whisper_{model_name}_inference/test_pred.csv"
         )

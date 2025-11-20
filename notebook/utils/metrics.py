@@ -5,11 +5,29 @@ import numpy as np
 wer_metric = evaluate.load("wer")
 cer_metric = evaluate.load("cer")
 
-def compute_metrics(pred, tokenizer, metric_name='cer'):
+def _prepare_prediction_ids(predictions: np.ndarray) -> np.ndarray:
+    """
+    Seq2SeqTrainer returns either generated token ids (when predict_with_generate=True)
+    or the raw logits (when predict_with_generate=False). This helper normalizes the
+    different formats into token ids that can be decoded by the tokenizer.
+    """
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+
+    predictions = np.asarray(predictions)
+
+    # If logits are provided, take argmax over the vocabulary dimension.
+    if predictions.ndim == 3:
+        predictions = predictions.argmax(axis=-1)
+
+    return predictions
+
+
+def compute_metrics(pred, tokenizer):
     """
     metric_name: "wer" or "cer"
     """
-    pred_ids = pred.predictions
+    pred_ids = _prepare_prediction_ids(pred.predictions)
     label_ids = pred.label_ids
 
     # replace -100 with the pad_token_id
@@ -19,13 +37,14 @@ def compute_metrics(pred, tokenizer, metric_name='cer'):
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-    # metric_name에 따라 wer 또는 cer 반환
-    if metric_name.lower() == "wer":
-        wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
-        return {"wer": wer}
-    else: # default is cer
-        cer = 100 * cer_metric.compute(predictions=pred_str, references=label_str)
-        return {"cer": cer}
+    # # metric_name에 따라 wer 또는 cer 반환
+    # if metric_name.lower() == "wer":
+    #     wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
+    #     print(wer)
+    #     return {"wer": wer}
+    # else: # default is cer
+    cer = 100 * cer_metric.compute(predictions=pred_str, references=label_str)
+    return {"cer": cer}
 
 if __name__ == "__main__":
     tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="Korean", task="transcribe")

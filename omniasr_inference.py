@@ -95,18 +95,18 @@ def run_inference_omni(model_card, csv_path, save_path=None, lang="kor_Hang"):
 if __name__ == "__main__":
     model_series = ['omniASR_CTC_300M', 'omniASR_CTC_1B', 'omniASR_CTC_3B', 'omniASR_CTC_7B']
     for model_card in model_series:
-        # Train CSV inference
-        run_inference_omni(
-            model_card=model_card,
-            csv_path="/workspace/kru_data/train.csv",
-            save_path=f"/workspace/results/omniasr_ctc/{model_card}/train_pred.csv",
-            lang="kor_Hang"
-        )
+        # # Train CSV inference
+        # run_inference_omni(
+        #     model_card=model_card,
+        #     csv_path="/workspace/kru_data/train.csv",
+        #     save_path=f"/workspace/results/omniasr_ctc/{model_card}/train_pred.csv",
+        #     lang="kor_Hang"
+        # )
 
         # Test CSV inference
         run_inference_omni(
             model_card=model_card,
             csv_path="/workspace/kru_data/test.csv",
-            save_path=f"/workspace/results/omniasr_ctc/{model_card}/test_pred.csv",
+            save_path=f"/workspace/results/omniasr_inference/omniasr_ctc/{model_card}/test_pred.csv",
             lang="kor_Hang"
         )
