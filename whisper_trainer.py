@@ -72,7 +72,7 @@ class WhisperTrainer:
         # 평가를 하지 않게 하기 위해 evaluation_strategy="no"로 설정
         return Seq2SeqTrainingArguments(
             output_dir=self.output_dir,
-            per_device_train_batch_size=24,
+            per_device_train_batch_size=16,
             per_device_eval_batch_size=16,
             gradient_accumulation_steps=1,
             learning_rate=1e-5,
@@ -129,7 +129,8 @@ def get_last_dir_name(path):
     return os.path.basename(os.path.normpath(path))
 
 if __name__ == "__main__":
-    model_series = ['tiny', 'base', 'small', 'medium', 'large', 'turbo']
+    # model_series = ['tiny', 'base', 'small', 'medium', 'large', 'turbo']
+    model_series = ['small', 'medium', 'large', 'turbo']
     
     for model_name in model_series:
         whisper_trainer = WhisperTrainer(
