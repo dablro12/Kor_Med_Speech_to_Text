@@ -69,32 +69,37 @@ class WhisperTrainer:
         )
 
     def _build_training_args(self) -> Seq2SeqTrainingArguments:
-        # 평가를 하지 않게 하기 위해 evaluation_strategy="no"로 설정
         return Seq2SeqTrainingArguments(
             output_dir=self.output_dir,
             per_device_train_batch_size=4,
-            per_device_eval_batch_size=1,
+            per_device_eval_batch_size=4,
             gradient_accumulation_steps=1,
             learning_rate=1e-5,
             warmup_steps=100,
-            max_steps=10000,
+
+            # -----------------------
+            # 🔥 Epoch 기반으로 변경
+            # -----------------------
+            num_train_epochs=5,       # 원하는 epoch 수 설정
+            max_steps=-1,             # or None (Epoch 우선 적용)
+            save_strategy="epoch",    # 매 epoch 저장
+            eval_strategy="no",       # 평가 비활성화 (그대로)
+            logging_strategy="steps", # 그대로 OK
+            # -----------------------
+
             fp16=False,
             bf16=True,
             gradient_checkpointing=False,
-            # eval_strategy="steps",
-            eval_strategy="no",  # 평가 전략 비활성화
             predict_with_generate=True,
             generation_max_length=225,
-            save_steps=2000,
-            eval_steps=2000,
             logging_steps=25,
+
             report_to=["tensorboard"],
-            # report_to=["wandb"],
             load_best_model_at_end=False,
             metric_for_best_model="cer",
             greater_is_better=False,
             push_to_hub=False,
-            logging_dir = self.logging_dir, # tensor board logging dir 
+            logging_dir=self.logging_dir,
         )
 
     def _build_trainer(self) -> Seq2SeqTrainer:
@@ -131,6 +136,7 @@ def get_last_dir_name(path):
 if __name__ == "__main__":
     # model_series = ['tiny', 'base', 'small', 'medium'] # 'large'는 OOM 발생 with RTX4090 
     model_series = ['tiny', 'base', 'small', 'medium']
+    
     for model_name in model_series:
         whisper_trainer = WhisperTrainer(
                 model_id=f"openai/whisper-{model_name}",

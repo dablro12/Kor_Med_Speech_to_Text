@@ -1,53 +1,80 @@
 import os
 import sys 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import time
 import torch
-import librosa           # ← torchaudio 대신 librosa
+import librosa
 import numpy as np
+import pandas as pd
+from tqdm import tqdm
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-def transcribe_audio(wav_path, model, processor, sampling_rate=16000):
-    # Load audio with librosa (auto-resample)
-    try:
-        audio, sr = librosa.load(wav_path, sr=sampling_rate)
-    except Exception as e:
-        print(f"[ERROR] Failed to load {wav_path}: {e}")
-        return ""
-
-    # Ensure float32 array
-    if not isinstance(audio, np.ndarray):
-        audio = np.array(audio, dtype=np.float32)
-
-    # Convert waveform to log-mel
-    input_features = processor.feature_extractor(
-        audio,
-        sampling_rate=sampling_rate,
-        return_tensors="pt"
-    ).input_features.to("cuda")
-
-    # Generate predicted ids
-    predicted_ids = model.generate(input_features)
-
-    # Decode text
-    transcription = processor.tokenizer.batch_decode(
-        predicted_ids,
-        skip_special_tokens=True
-    )[0]
-
-    return transcription
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
+# --------------------------------------------------------
+# 1) Auto Batch 기반 Whisper 배치 inference + time tracking
+# --------------------------------------------------------
+def transcribe_batch_auto(batch_paths, model, processor, sampling_rate=16000, init_batch_size=64):
+    """
+    Whisper 배치 inference 자동 스케일링 + 배치 단위 소요시간 측정
+    """
+    batch_size = min(init_batch_size, len(batch_paths))
+    audios = []
 
-import os
-import pandas as pd
-from tqdm import tqdm 
-def run_inference(model_name, csv_path, save_path=None):
-    # Load Whisper Small
+    # Load audio
+    for path in batch_paths:
+        try:
+            audio, _ = librosa.load(path, sr=sampling_rate)
+        except:
+            audio = np.zeros(sampling_rate, dtype=np.float32)
+        audios.append(audio)
+
+    while batch_size > 0:
+        try:
+            t0 = time.time()
+
+            input_features = processor.feature_extractor(
+                audios[:batch_size],
+                sampling_rate=sampling_rate,
+                return_tensors="pt"
+            ).input_features.to("cuda")
+
+            predicted_ids = model.generate(input_features)
+            transcriptions = processor.tokenizer.batch_decode(
+                predicted_ids, skip_special_tokens=True
+            )
+
+            t1 = time.time()
+            elapsed = t1 - t0  # total time for this batch
+
+            # per-file time
+            per_sample_time = elapsed / batch_size
+            per_times = [per_sample_time] * batch_size
+
+            return transcriptions, per_times, batch_size
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"[WARN] OOM → batch_size {batch_size} → {batch_size // 2}")
+                torch.cuda.empty_cache()
+                batch_size //= 2
+            else:
+                print("[ERROR] Unexpected error:", e)
+                return [""] * batch_size, [0] * batch_size, batch_size
+
+    return [""] * len(batch_paths), [0] * len(batch_paths), 1
+
+
+
+# --------------------------------------------------------
+# 2) Inference + Parquet 저장 + Auto Batch + time tracking
+# --------------------------------------------------------
+def run_inference(model_name, csv_path, save_path=None, init_batch_size=64):
     processor = WhisperProcessor.from_pretrained(
-        model_name,
-        language="ko",
-        task="transcribe"
+        model_name, language="ko", task="transcribe"
     )
     model = WhisperForConditionalGeneration.from_pretrained(model_name).to("cuda")
 
@@ -57,61 +84,103 @@ def run_inference(model_name, csv_path, save_path=None):
         "abs_path": [],
         "gt_text": [],
         "pred_text": [],
+        "inference_time_sec": [],   # 🔥 추가됨
     }
 
-    save_dir = os.path.dirname(save_path)
-    if save_dir and not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    parquet_path = save_path.replace(".csv", ".parquet")
+    save_dir = os.path.dirname(parquet_path)
+    os.makedirs(save_dir, exist_ok=True)
 
-    # Try to load previous DF, if file does not exist, just start fresh
-    if save_path and os.path.exists(save_path):
-        prev_df = pd.read_csv(save_path)
+    # Resume
+    if os.path.exists(parquet_path):
+        prev_df = pq.read_table(parquet_path).to_pandas()
+
         done = set(prev_df["abs_path"].tolist())
         results["abs_path"].extend(prev_df["abs_path"].tolist())
         results["gt_text"].extend(prev_df["gt_text"].tolist())
         results["pred_text"].extend(prev_df["pred_text"].tolist())
+        results["inference_time_sec"].extend(prev_df["inference_time_sec"].tolist())
+
+        print(f"[INFO] Resumed from {parquet_path}")
     else:
         done = set()
 
+    batch_paths = []
+    batch_gt = []
+    batch_times = []
+
+    last_saved_count = len(results["abs_path"])
+
+    print(f"[INFO] Total rows = {len(df)}, Already processed = {len(done)}")
+
+    # -----------------------------
+    # Batch inference loop
+    # -----------------------------
     for _, row in tqdm(df.iterrows(), total=len(df)):
         audio_path = row["abs_path"]
         gt_text = row["transcription"]
 
-        # Skip already processed files
         if audio_path in done:
             continue
 
-        try:
-            pred = transcribe_audio(audio_path, model, processor)
-        except Exception as e:
-            print(f"[Error] {audio_path} : {e}")
-            pred = ""
+        batch_paths.append(audio_path)
+        batch_gt.append(gt_text)
 
-        results["abs_path"].append(audio_path)
-        results["gt_text"].append(gt_text)
-        results["pred_text"].append(pred)
+        if len(batch_paths) >= init_batch_size:
 
-        # Save after every row
-        if save_path:
-            pd.DataFrame(results).to_csv(save_path, index=False)
-            print(f"Saved progress → {save_path}")
-            
-        # break  # NOTE: Remove or comment out this break if you want to process all rows!
-    out_df = pd.DataFrame(results)
+            preds, per_times, used_bs = transcribe_batch_auto(
+                batch_paths, model, processor, init_batch_size=init_batch_size
+            )
 
-    return out_df
+            results["abs_path"].extend(batch_paths[:used_bs])
+            results["gt_text"].extend(batch_gt[:used_bs])
+            results["pred_text"].extend(preds)
+            results["inference_time_sec"].extend(per_times)
 
+            # Remove processed
+            batch_paths = batch_paths[used_bs:]
+            batch_gt = batch_gt[used_bs:]
+
+            # Save every 10k
+            if (len(results["abs_path"]) - last_saved_count) >= 10000:
+                print(f"[INFO] Saving chunk → {parquet_path}")
+                table = pa.Table.from_pandas(pd.DataFrame(results))
+                pq.write_table(table, parquet_path)
+                last_saved_count = len(results["abs_path"])
+
+    # -----------------------------
+    # 마지막 남은 batch
+    # -----------------------------
+    if len(batch_paths) > 0:
+        preds, per_times, used_bs = transcribe_batch_auto(
+            batch_paths, model, processor, init_batch_size=init_batch_size
+        )
+        results["abs_path"].extend(batch_paths[:used_bs])
+        results["gt_text"].extend(batch_gt[:used_bs])
+        results["pred_text"].extend(preds)
+        results["inference_time_sec"].extend(per_times)
+
+    # -----------------------------
+    # 최종 저장
+    # -----------------------------
+    print(f"[INFO] Final save → {parquet_path}")
+    table = pa.Table.from_pandas(pd.DataFrame(results))
+    pq.write_table(table, parquet_path)
+
+    return pd.DataFrame(results)
+
+
+
+# --------------------------------------------------------
+# 3) 실행
+# --------------------------------------------------------
 if __name__ == "__main__":
-    model_series = ['tiny', 'base', 'small', 'medium', 'large', 'turbo']
-    
+    model_series = ['base', 'small', 'medium', 'tiny']
+
     for model_name in model_series:
-        # run_inference(
-        #     model_name=f"openai/whisper-{model_name}",
-        #     csv_path="/workspace/kru_data/train.csv",
-        #     save_path=f"/workspace/results/whisper_inference/whisper_{model_name}_inference/train_pred.csv"
-        # )
         run_inference(
             model_name=f"openai/whisper-{model_name}",
             csv_path="/workspace/kru_data/test.csv",
-            save_path=f"/workspace/results/whisper_inference/whisper_{model_name}_inference/test_pred.csv"
+            save_path=f"/workspace/results/whisper_inference/whisper_{model_name}_inference/test_pred.csv",
+            init_batch_size=1024
         )

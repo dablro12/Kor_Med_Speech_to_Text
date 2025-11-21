@@ -1,97 +1,189 @@
-
 import os
-import time
-from datetime import timedelta
-
-import pandas as pd
 import torch
-from transformers import (
-    AutoModelForSpeechSeq2Seq,
-    AutoProcessor,
-    pipeline as asr_pipeline,
-)
+import pandas as pd
+import librosa
+import numpy as np
+from transformers import AutoProcessor, WhisperForConditionalGeneration
+import pyarrow.parquet as pq
+import pyarrow as pa
+from tqdm import tqdm
+import transformers
+import time
 
-# Environment configuration
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-os.environ.setdefault("NCCL_IB_DISABLE", "1")
+transformers.logging.set_verbosity_error()
 
+class WhisperInference:
+    def __init__(
+        self,
+        model_dir: str,
+        sampling_rate: int = 16000,
+        device: str = "cuda",
+        save_every: int = 10000,
+        init_batch_size: int = 64
+    ):
+        self.model_dir = model_dir
+        self.sampling_rate = sampling_rate
+        self.device = device
+        self.save_every = save_every
+        self.init_batch_size = init_batch_size
 
-MODEL_SERIES = ["tiny", "base", "small", "medium", "large", "turbo"]
-CSV_PATH = "/workspace/kru_data/test.csv"
-AUDIO_COLUMN = "abs_path"
-TRANSCRIPT_COLUMN = "transcription"
-RESULTS_DIR = "/workspace/results/whisper_tester"
-os.makedirs(RESULTS_DIR, exist_ok=True)
+        # base model name
+        model_name = os.path.basename(os.path.dirname(self.model_dir))
+        hf_model_id = f"openai/{model_name}"
 
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
+        # Processor
+        self.processor = AutoProcessor.from_pretrained(
+            hf_model_id, language="ko", task="transcribe"
+        )
 
-
-def load_dataset(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    missing_cols = [col for col in (AUDIO_COLUMN, TRANSCRIPT_COLUMN) if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns in {csv_path}: {missing_cols}")
-    return df
-
-
-def benchmark_model(model_id: str, df: pd.DataFrame) -> tuple[float, int]:
-    print(f"\nEvaluating model: {model_id}")
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id,
-        torch_dtype=DTYPE,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-    ).to(DEVICE)
-
-    processor = AutoProcessor.from_pretrained(model_id)
-    asr = asr_pipeline(
-        task="automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        torch_dtype=DTYPE,
-        device=DEVICE,
-    )
-
-    total_time = 0.0
-    processed = 0
-    for _, row in df.iterrows():
-        audio_path = row[AUDIO_COLUMN]
-        if not os.path.exists(audio_path):
-            print(f"[WARN] Missing audio file: {audio_path}")
-            continue
-
-        start = time.time()
-        _ = asr(audio_path)
-        total_time += time.time() - start
-        processed += 1
-
-    average = total_time / processed if processed else float("nan")
-    print(f"Average inference time ({model_id}): {average:.4f}s over {processed} samples")
-    return average, processed
+        # Model
+        self.model = WhisperForConditionalGeneration.from_pretrained(model_dir).to(device)
 
 
-def log_results(model_id: str, avg_time: float, processed: int, elapsed: float) -> None:
-    process_dir = os.path.join(RESULTS_DIR, model_id.replace("/", "_"))
-    os.makedirs(process_dir, exist_ok=True)
-    log_path = os.path.join(process_dir, "benchmark.log")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"Average inference time: {avg_time:.4f}s\n")
-        f.write(f"Processed samples: {processed}\n")
-        f.write(f"Total elapsed time: {elapsed:.2f}s ({timedelta(seconds=elapsed)})\n")
+    # ---------------------------------------------------------
+    # 🔥 1) 배치 inference + VRAM 자동 조절 + 타이머 추가
+    # ---------------------------------------------------------
+    def transcribe_batch(self, batch_paths):
+        batch_size = len(batch_paths)
+        audios = []
+
+        for p in batch_paths:
+            try:
+                audio, _ = librosa.load(p, sr=self.sampling_rate)
+            except:
+                audio = np.zeros(self.sampling_rate, dtype=np.float32)
+            audios.append(audio)
+
+        bs = min(batch_size, self.init_batch_size)
+
+        while bs > 0:
+            try:
+                feats = self.processor.feature_extractor(
+                    audios[:bs],
+                    sampling_rate=self.sampling_rate,
+                    return_tensors="pt"
+                ).input_features.to(self.device)
+
+                torch.cuda.synchronize()
+                t0 = time.time()
+
+                with torch.no_grad():
+                    pred_ids = self.model.generate(feats)
+
+                torch.cuda.synchronize()
+                t1 = time.time()
+
+                batch_time = t1 - t0
+                per_sample_time = batch_time / bs
+
+                texts = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
+
+                return texts, [per_sample_time] * bs, bs
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"[WARN] OOM 발생 → batch_size {bs} → {bs//2}")
+                    torch.cuda.empty_cache()
+                    bs //= 2
+                else:
+                    print("[ERROR]", e)
+                    return [""] * bs, [0.0] * bs, bs
+
+        return [""] * batch_size, [0.0] * batch_size, 1
 
 
-def main() -> None:
-    df = load_dataset(CSV_PATH)
-    for model_name in MODEL_SERIES:
-        model_id = f"openai/whisper-{model_name}"
-        start_time = time.time()
-        avg_time, processed = benchmark_model(model_id, df)
-        elapsed = time.time() - start_time
-        log_results(model_id, avg_time, processed, elapsed)
+    # ---------------------------------------------------------
+    # 🔥 2) CSV + tqdm + resume + auto-save (inference_time 저장)
+    # ---------------------------------------------------------
+    def transcribe_csv_auto(
+        self,
+        input_csv: str,
+        audio_column: str = "abs_path",
+        gt_column: str = "gt_text",
+        output_parquet: str = "test_pred.parquet",
+    ):
+        df = pd.read_csv(input_csv)
 
+        results = {
+            "abs_path": [],
+            "gt_text": [],
+            "pred_text": [],
+            "inference_time_sec": []
+        }
+        done = set()
 
-if __name__ == "__main__":
-    main()
+        # Resume logic
+        if os.path.exists(output_parquet):
+            prev = pq.read_table(output_parquet).to_pandas()
+            results["abs_path"] = prev["abs_path"].tolist()
+            results["gt_text"] = prev["gt_text"].tolist()
+            results["pred_text"] = prev["pred_text"].tolist()
+
+            # 🔥 기존 inference_time도 resume
+            if "inference_time_sec" in prev.columns:
+                results["inference_time_sec"] = prev["inference_time_sec"].tolist()
+            else:
+                results["inference_time_sec"] = [0.0] * len(prev)
+
+            done = set(results["abs_path"])
+            print(f"[INFO] Resume from {output_parquet} ({len(done)} rows)")
+
+        last_saved = len(results["abs_path"])
+        batch_paths = []
+        batch_gt = []
+
+        total_remaining = len(df) - len(done)
+        pbar = tqdm(total=total_remaining, desc="Transcribing", unit="audio")
+
+        for _, row in df.iterrows():
+            audio_path = row[audio_column]
+            gt_text = row[gt_column]
+
+            if audio_path in done:
+                pbar.update(1)
+                continue
+
+            batch_paths.append(audio_path)
+            batch_gt.append(gt_text)
+
+            if len(batch_paths) >= self.init_batch_size:
+                preds, times, used_bs = self.transcribe_batch(batch_paths)
+
+                results["abs_path"].extend(batch_paths[:used_bs])
+                results["gt_text"].extend(batch_gt[:used_bs])
+                results["pred_text"].extend(preds)
+                results["inference_time_sec"].extend(times)
+
+                batch_paths = batch_paths[used_bs:]
+                batch_gt = batch_gt[used_bs:]
+                pbar.update(used_bs)
+
+                processed = len(results["abs_path"]) - last_saved
+                if processed >= self.save_every:
+                    print(f"[INFO] Auto-save → {output_parquet}")
+
+                    os.makedirs(os.path.dirname(output_parquet), exist_ok=True)
+
+                    table = pa.Table.from_pandas(pd.DataFrame(results))
+                    pq.write_table(table, output_parquet)
+                    last_saved = len(results["abs_path"])
+
+        # 마지막 남은 batch
+        if len(batch_paths) > 0:
+            preds, times, used_bs = self.transcribe_batch(batch_paths)
+
+            results["abs_path"].extend(batch_paths[:used_bs])
+            results["gt_text"].extend(batch_gt[:used_bs])
+            results["pred_text"].extend(preds)
+            results["inference_time_sec"].extend(times)
+            pbar.update(used_bs)
+
+        pbar.close()
+
+        print(f"[INFO] Final save → {output_parquet}")
+
+        os.makedirs(os.path.dirname(output_parquet), exist_ok=True)
+        table = pa.Table.from_pandas(pd.DataFrame(results))
+        pq.write_table(table, output_parquet)
+
+        return pd.DataFrame(results)
