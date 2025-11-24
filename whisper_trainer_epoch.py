@@ -1,8 +1,8 @@
-
 import os
 import sys
 import time
 from datetime import timedelta
+import torch
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["NCCL_P2P_DISABLE"] = "1"
@@ -19,152 +19,192 @@ sys.path.append("/workspace/notebook")
 from utils.data_dataset import KruWhisperDataset, DataCollatorSpeechSeq2SeqWithPadding
 from utils.metrics import compute_metrics
 
+import librosa
+
+def find_max_batch_size(model_id, processor, dataset, start_bs=16, min_bs=1, sampling_rate=16000):
+    """
+    GPU VRAM 한도 내에서 실제 학습 가능한 batch size 자동 탐색
+    ★ 학습 모델과 분리된 별도 모델로 테스트(backward)
+    """
+
+    # -----------------------------
+    # 1) 테스트용 임시 모델 생성 (학습모델과 완전히 분리)
+    # -----------------------------
+    test_model = WhisperForConditionalGeneration.from_pretrained(model_id).to("cuda")
+    test_model.train()
+
+    # -----------------------------
+    # 2) 가장 긴 오디오 기준으로 mel 생성
+    # -----------------------------
+    first = dataset[0]
+    audio_path = first.get("abs_path") or first.get("audio_path")
+    if not audio_path:
+        raise KeyError("Dataset missing 'abs_path' or 'audio_path'")
+
+    audio, _ = librosa.load(audio_path, sr=sampling_rate)
+    feat = processor.feature_extractor(
+        audio, sampling_rate=sampling_rate, return_tensors="pt"
+    ).input_features.to("cuda")
+
+    dummy_label = torch.tensor(
+        [[processor.tokenizer.bos_token_id]],
+        dtype=torch.long,
+        device="cuda"
+    )
+
+    # -----------------------------
+    # 3) backward 테스트 (optimizer 없음)
+    # -----------------------------
+    print(f"[INFO] Auto batch scaling start (requested={start_bs})")
+    batch_size = start_bs
+
+    while batch_size >= min_bs:
+        try:
+            torch.cuda.empty_cache()
+
+            dummy_in = feat.repeat(batch_size, 1, 1)
+            dummy_lab = dummy_label.repeat(batch_size, 1)
+
+            test_model.zero_grad(set_to_none=True)
+
+            out = test_model(input_features=dummy_in, labels=dummy_lab)
+            loss = out.loss
+
+            loss.backward()  # only once
+
+            print(f"[OK] TRAIN batch_size {batch_size} fits GPU memory")
+
+            # cleanup
+            del test_model
+            torch.cuda.empty_cache()
+            return batch_size
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"[WARN] OOM → {batch_size} → {batch_size//2}")
+                batch_size //= 2
+                torch.cuda.empty_cache()
+            else:
+                raise e
+
+    print("[ERROR] Default batch size = 1")
+    del test_model
+    torch.cuda.empty_cache()
+    return 1
+
+
+
 class WhisperTrainer:
     def __init__(
         self,
-        model_id: str = "openai/whisper-small",
-        language: str = "ko",
-        task: str = "transcribe",
-        train_csv_path: str = "/workspace/kru_data/train.csv",
-        eval_csv_path: str = "/workspace/kru_data/test.csv",
-        sampling_rate: int = 16000,
-        output_dir: str = "/workspace/kru_data/results/whisper-small-ko",
-        logging_dir : str = "/workspace/logs",
-        do_eval: bool = False,  # 평가 비활성 플래그 추가
-    ) -> None:
+        model_id="openai/whisper-small",
+        language="ko",
+        task="transcribe",
+        train_csv_path="/workspace/kru_data/train.csv",
+        eval_csv_path="/workspace/kru_data/test.csv",
+        sampling_rate=16000,
+        output_dir="/workspace/kru_data/results/whisper-small-ko",
+        logging_dir="/workspace/logs",
+        do_eval=False,
+        init_batch_size=64,      # ⭐ 추가됨
+    ):
         self.model_id = model_id
         self.language = language
         self.task = task
-        self.train_csv_path = train_csv_path
-        self.eval_csv_path = eval_csv_path
-        self.sampling_rate = sampling_rate
         self.output_dir = output_dir
         self.logging_dir = logging_dir
-        self.do_eval = do_eval  # 평가 플래그 저장
+        self.train_csv_path = train_csv_path
+        self.eval_csv_path = eval_csv_path
+        self.do_eval = do_eval
+        self.sampling_rate = sampling_rate
 
-        self.processor = WhisperProcessor.from_pretrained(
-            self.model_id,
-            language=self.language,
-            task=self.task,
-        )
+        self.processor = WhisperProcessor.from_pretrained(model_id, language=language, task=task)
         self.feature_extractor = self.processor.feature_extractor
         self.tokenizer = self.processor.tokenizer
 
-        self.train_dataset = self._build_dataset(self.train_csv_path)
-        self.eval_dataset = self._build_dataset(self.eval_csv_path) if self.do_eval else None
+        self.train_dataset = self._build_dataset(train_csv_path)
+        self.eval_dataset = self._build_dataset(eval_csv_path) if do_eval else None
         self.data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-            processor=self.processor,
-            decoder_start_token_id=self.tokenizer.bos_token_id,
+            processor=self.processor, decoder_start_token_id=self.tokenizer.bos_token_id
         )
-        self.model = WhisperForConditionalGeneration.from_pretrained(self.model_id)
-        self.training_args = self._build_training_args()
+
+        self.model = WhisperForConditionalGeneration.from_pretrained(model_id).to("cuda")
+
+        # 🔥 GPU 메모리 기반 배치 사이즈 최종 결정
+        auto_bs = find_max_batch_size(
+            model_id=self.model_id,
+            processor=self.processor,
+            dataset=self.train_dataset,
+            start_bs=init_batch_size
+        )
+
+        print(f"[INFO] Selected Batch Size: {auto_bs}")
+
+        self.training_args = self._build_training_args(auto_bs)
         self.trainer = self._build_trainer()
 
-    def _build_dataset(self, csv_path: str) -> KruWhisperDataset:
+    def _build_dataset(self, csv_path):
         return KruWhisperDataset(
             csv_path=csv_path,
             feature_extractor=self.feature_extractor,
             tokenizer=self.tokenizer,
-            sampling_rate=self.sampling_rate,
+            sampling_rate=self.sampling_rate
         )
 
-    def _build_training_args(self) -> Seq2SeqTrainingArguments:
+    def _build_training_args(self, batch_size):
         return Seq2SeqTrainingArguments(
             output_dir=self.output_dir,
-            per_device_train_batch_size=4,
-            per_device_eval_batch_size=4,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
             gradient_accumulation_steps=1,
             learning_rate=1e-5,
             warmup_steps=100,
-
-            # -----------------------
-            # 🔥 Epoch 기반으로 변경
-            # -----------------------
-            num_train_epochs=5,       # 원하는 epoch 수 설정
-            max_steps=-1,             # or None (Epoch 우선 적용)
-            save_strategy="epoch",    # 매 epoch 저장
-            eval_strategy="no",       # 평가 비활성화 (그대로)
-            logging_strategy="steps", # 그대로 OK
-            # -----------------------
-
-            fp16=False,
+            num_train_epochs=5,
+            save_strategy="epoch",
+            eval_strategy="no",
+            logging_strategy="steps",
             bf16=True,
             gradient_checkpointing=False,
             predict_with_generate=True,
-            generation_max_length=225,
             logging_steps=25,
-
             report_to=["tensorboard"],
             load_best_model_at_end=False,
-            metric_for_best_model="cer",
-            greater_is_better=False,
-            push_to_hub=False,
-            logging_dir=self.logging_dir,
         )
 
-    def _build_trainer(self) -> Seq2SeqTrainer:
-        # 평가/metrics 관련 인자도 조건에 따라 비활성화
-        if self.do_eval:
-            return Seq2SeqTrainer(
-                args=self.training_args,
-                model=self.model,
-                train_dataset=self.train_dataset,
-                eval_dataset=self.eval_dataset,
-                data_collator=self.data_collator,
-                compute_metrics=compute_metrics,
-                tokenizer=self.processor.tokenizer,
-            )
-        else:
-            return Seq2SeqTrainer(
-                args=self.training_args,
-                model=self.model,
-                train_dataset=self.train_dataset,
-                # eval_dataset=self.eval_dataset,  # 평가 데이터셋 비활성화
-                data_collator=self.data_collator,
-                compute_metrics=compute_metrics,  # metrics 비활성화
-                tokenizer=self.processor.tokenizer,
-            )
+    def _build_trainer(self):
+        return Seq2SeqTrainer(
+            args=self.training_args,
+            model=self.model,
+            train_dataset=self.train_dataset,
+            data_collator=self.data_collator,
+            compute_metrics=None if not self.do_eval else compute_metrics,
+            tokenizer=self.processor.tokenizer,
+        )
 
-    def train(self) -> Seq2SeqTrainer:
+    def train(self):
         self.trainer.train()
-        return self.trainer
 
-def get_last_dir_name(path):
-    """output_dir에서 마지막 디렉토리 이름 추출"""
-    return os.path.basename(os.path.normpath(path))
 
 if __name__ == "__main__":
-    # model_series = ['tiny', 'base', 'small', 'medium'] # 'large'는 OOM 발생 with RTX4090 
     model_series = ['tiny', 'base', 'small', 'medium']
-    
+
     for model_name in model_series:
         whisper_trainer = WhisperTrainer(
-                model_id=f"openai/whisper-{model_name}",
-                language="ko",
-                task="transcribe",
-                train_csv_path="/workspace/kru_data/train.csv",
-                eval_csv_path="/workspace/kru_data/test.csv",
-                sampling_rate=16000,
-                output_dir=f"/workspace/results/whisper_train/whisper-{model_name}",
-                logging_dir=f"/workspace/logs/whisper-{model_name}", # tensorboard logging dir 
-                do_eval=False,  # 평가 끄기
-            )
-        
-        # 훈련 시작시간 측정
-        start_time = time.time()
-        whisper_trainer.train() # Training
-        end_time = time.time()
-        elapsed = end_time - start_time
+            model_id=f"openai/whisper-{model_name}",
+            init_batch_size=1024,       # ⭐ 여기서 조정 가능
+            do_eval=False,
+            output_dir=f"/workspace/results/whisper_train/whisper-{model_name}",
+            logging_dir=f"/workspace/logs/whisper-{model_name}"
+        )
 
-        elapsed_td = timedelta(seconds=elapsed)
-        elapsed_str = str(elapsed_td)
-        # 로그 폴더 만들고 파일 경로 지정
-        process_dir = whisper_trainer.output_dir + "/process"
-        os.makedirs(process_dir, exist_ok=True)
-        log_file_path = process_dir + "/time.log"
+        start = time.time()
+        whisper_trainer.train()
+        elapsed = timedelta(seconds=(time.time() - start))
 
-        with open(log_file_path, "a", encoding="utf-8") as f:
-            f.write(f"Training time: {elapsed:.2f} seconds\n")
-            f.write(f"Training time (hh:mm:ss): {elapsed_str}\n")
+        log_path = f"{whisper_trainer.output_dir}/process"
+        os.makedirs(log_path, exist_ok=True)
 
-    print(f"Training time: {elapsed:.2f} seconds ({elapsed_str}) - saved to {log_file_path}")
+        with open(f"{log_path}/time.log", "a") as f:
+            f.write(f"Training Time: {elapsed}\n")
+
+        print(f"[DONE] {model_name} completed. Time: {elapsed}")
