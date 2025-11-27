@@ -17,6 +17,7 @@ def fast_asr_metrics(df, gt_col="gt_text", pred_col="pred_text"):
     # sample-level은 jiwer로 초고속 처리
     sample_wers = [100 * jiwer_wer([g], [p]) for g, p in zip(gts, preds)]
     sample_cers = [100 * jiwer_cer([g], [p]) for g, p in zip(gts, preds)]
+    
 
     return {
         "wer_all": wer_all,
@@ -31,6 +32,11 @@ def fast_asr_metrics(df, gt_col="gt_text", pred_col="pred_text"):
         "cer_median": float(np.median(sample_cers)),
         "cer_min": float(np.min(sample_cers)),
         "cer_max": float(np.max(sample_cers)),
+        "inference_time_sec_mean": float(np.mean(df["inference_time_sec"])),
+        "inference_time_sec_std": float(np.std(df["inference_time_sec"])),
+        "inference_time_sec_median": float(np.median(df["inference_time_sec"])),
+        "inference_time_sec_min": float(np.min(df["inference_time_sec"])),
+        "inference_time_sec_max": float(np.max(df["inference_time_sec"])),
         "num_samples": len(sample_wers)
     }
 

@@ -99,7 +99,7 @@ class WhisperInference:
         self,
         input_csv: str,
         audio_column: str = "abs_path",
-        gt_column: str = "gt_text",
+        gt_column: str = "transcription",
         output_parquet: str = "test_pred.parquet",
     ):
         df = pd.read_csv(input_csv)
@@ -187,3 +187,34 @@ class WhisperInference:
         pq.write_table(table, output_parquet)
 
         return pd.DataFrame(results)
+
+import argparse
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="WhisperInference batch transcriber")
+    parser.add_argument("--model_dir", type=str, required=True, help="Path to the model directory (Huggingface checkpoint folder).")
+    parser.add_argument("--input_csv", type=str, required=True, help="Input CSV file path with 'abs_path' and 'gt_text' columns.")
+    parser.add_argument("--output_parquet", type=str, required=True, help="Output Parquet file path for predictions.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use: 'cuda' or 'cpu'.")
+    parser.add_argument("--save_every", type=int, default=1000, help="Frequency of autosaving.")
+    parser.add_argument("--init_batch_size", type=int, default=16, help="Initial batch size for inference.")
+    parser.add_argument("--sampling_rate", type=int, default=16000, help="Sampling rate for audio loading.")
+    parser.add_argument("--audio_column", type=str, default="abs_path", help="CSV column name for audio file paths.")
+    parser.add_argument("--gt_column", type=str, default="gt_text", help="CSV column name for ground truth.")
+
+    args = parser.parse_args()
+
+    whisper_infer = WhisperInference(
+        model_dir=args.model_dir,
+        sampling_rate=args.sampling_rate,
+        device=args.device,
+        save_every=args.save_every,
+        init_batch_size=args.init_batch_size
+    )
+
+    whisper_infer.transcribe_csv_auto(
+        input_csv=args.input_csv,
+        audio_column=args.audio_column,
+        gt_column=args.gt_column,
+        output_parquet=args.output_parquet
+    )

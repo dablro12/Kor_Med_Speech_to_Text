@@ -174,13 +174,27 @@ def run_inference(model_name, csv_path, save_path=None, init_batch_size=64):
 # --------------------------------------------------------
 # 3) 실행
 # --------------------------------------------------------
+import argparse
+
 if __name__ == "__main__":
-    model_series = ['base', 'small', 'medium', 'tiny']
+    parser = argparse.ArgumentParser(description="Whisper Batch Inference Runner")
+    parser.add_argument("--models", type=str, default="base,small,medium,tiny",
+                        help="Comma-separated list of whisper model sizes. e.g. base,small")
+    parser.add_argument("--csv_path", type=str, required=True,
+                        help="Path to input CSV file.")
+    parser.add_argument("--save_dir", type=str, required=True,
+                        help="Directory to save inference results. File will be named as test_pred.csv under per-model subdir.")
+    parser.add_argument("--init_batch_size", type=int, default=1024,
+                        help="Initial batch size for inference.")
+
+    args = parser.parse_args()
+    model_series = [m.strip() for m in args.models.split(",")]
 
     for model_name in model_series:
+        save_path = os.path.join(args.save_dir, f"whisper_{model_name}_inference", "test_pred.csv")
         run_inference(
             model_name=f"openai/whisper-{model_name}",
-            csv_path="/workspace/kru_data/test.csv",
-            save_path=f"/workspace/results/whisper_inference/whisper_{model_name}_inference/test_pred.csv",
-            init_batch_size=1024
+            csv_path=args.csv_path,
+            save_path=save_path,
+            init_batch_size=args.init_batch_size
         )
