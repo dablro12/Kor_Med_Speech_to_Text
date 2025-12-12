@@ -15,6 +15,7 @@ def wav_load(wav_path, sampling_rate=16000):
     
     return data
 
+
 if __name__ == "__main__":
     wav_path = '/workspace/kru_data/train/00000000.wav'
     data = wav_load(wav_path, sampling_rate=16000)

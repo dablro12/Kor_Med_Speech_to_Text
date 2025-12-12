@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
 from transformers import WhisperProcessor
-
-
 class KruWhisperDataset(Dataset):
     def __init__(self, csv_path, feature_extractor, tokenizer, sampling_rate=16000):
         self.df = pd.read_csv(csv_path)
@@ -52,34 +50,67 @@ class KruWhisperDataset(Dataset):
             "text": text,
         }
 
-
+    
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
+    """
+    Data collator that will dynamically pad the inputs received.
+    Args:
+        processor ([`WhisperProcessor`])
+            The processor used for processing the data.
+        decoder_start_token_id (`int`)
+            The begin-of-sentence of the decoder.
+        forward_attention_mask (`bool`)
+            Whether to return attention_mask.
+    """
+
     processor: Any
-    decoder_start_token_id: int
+#     decoder_start_token_id: int
+#     forward_attention_mask: bool
 
-    def __call__(self, features):
-        input_features = [f["input_features"] for f in features]
+    def __call__(
+        self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
+    ) -> Dict[str, torch.Tensor]:
+        # split inputs and labels since they have to be of different lengths and need
+        # different padding methods
+        model_input_name = self.processor.model_input_names[0]
+        input_features = [
+            {model_input_name: feature[model_input_name]} for feature in features
+        ]
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+
         batch = self.processor.feature_extractor.pad(
-            {"input_features": input_features}, return_tensors="pt"
+            input_features, return_tensors="pt"
         )
 
-        labels = [f["labels"] for f in features]
-        labels_batch = self.processor.tokenizer.pad(
-            {"input_ids": labels}, return_tensors="pt"
-        )
+#         if self.forward_attention_mask:
+#             batch["attention_mask"] = torch.LongTensor(
+#                 [feature["attention_mask"] for feature in features]
+#             )
 
-        labels = labels_batch["input_ids"].masked_fill(
-            labels_batch.attention_mask.ne(1), -100
-        )
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+        
+        # replace padding with -100 to ignore loss correctly
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
-        # remove BOS token
-        if (labels[:, 0] == self.decoder_start_token_id).all():
+        # if bos token is appended in previous tokenization step,
+        # cut bos token here as it's append later anyways
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
             labels = labels[:, 1:]
+        
+        # replace padding with -100 to ignore loss correctly
+#         labels = labels_batch["input_ids"].masked_fill(
+#             labels_batch.attention_mask.ne(1), -100
+#         )
+
+#         # if bos token is appended in previous tokenization step,
+#         # cut bos token here as it's append later anyways
+#         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+#             labels = labels[:, 1:]
 
         batch["labels"] = labels
-        return batch
 
+        return batch
 
 if __name__ == "__main__":
     processor = WhisperProcessor.from_pretrained(
